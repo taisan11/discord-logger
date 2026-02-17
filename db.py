@@ -40,6 +40,9 @@ class DiscordDB:
                 channel_id INTEGER PRIMARY KEY,
                 guild_id INTEGER NOT NULL,
                 channel_name TEXT NOT NULL,
+                parent_channel_id INTEGER,
+                channel_type TEXT,
+                raw_json BLOB,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -117,6 +120,9 @@ class DiscordDB:
 
         # Ensure schema upgrades for existing databases
         self._ensure_column("messages", "raw_json", "BLOB")
+        self._ensure_column("channels", "parent_channel_id", "INTEGER")
+        self._ensure_column("channels", "channel_type", "TEXT")
+        self._ensure_column("channels", "raw_json", "BLOB")
 
     def _ensure_column(self, table: str, column: str, column_type: str) -> None:
         """Ensure a column exists in a table (simple migration)."""
@@ -145,15 +151,25 @@ class DiscordDB:
         except Exception:
             return None
 
-    def add_channel(self, channel_id: int, guild_id: int, channel_name: str):
+    def add_channel(
+        self,
+        channel_id: int,
+        guild_id: int,
+        channel_name: str,
+        parent_channel_id: Optional[int] = None,
+        channel_type: Optional[str] = None,
+        raw_json: Optional[Any] = None,
+    ):
         """Add or update a channel."""
         self.connect()
         assert self.connection is not None
         cursor = self.connection.cursor()
+        raw_blob = self._compress_json(raw_json)
         cursor.execute("""
-            INSERT OR REPLACE INTO channels (channel_id, guild_id, channel_name, updated_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        """, (channel_id, guild_id, channel_name))
+            INSERT OR REPLACE INTO channels
+            (channel_id, guild_id, channel_name, parent_channel_id, channel_type, raw_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (channel_id, guild_id, channel_name, parent_channel_id, channel_type, raw_blob))
         self.connection.commit()
 
     def get_channels(self) -> List[Dict[str, Any]]:

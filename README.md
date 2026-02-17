@@ -122,6 +122,9 @@ python main.py
 - `channel_id`: Discord チャンネルID（主キー）
 - `guild_id`: Discord サーバーID
 - `channel_name`: チャンネル名
+- `parent_channel_id`: 親チャンネルID（スレッド等）
+- `channel_type`: チャンネル種別（text/voice/forum/thread など）
+- `raw_json`: チャンネルの生データ（圧縮）
 - `created_at`: レコード作成日時
 - `updated_at`: レコード更新日時
 

@@ -271,7 +271,7 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
             if isinstance(item, GuildListItem):
                 self.selected_guild = item.guild_id
                 self.notify(f"Selected server: {item.guild_name}")
-                self._load_channels_for_guild(item.guild_id)
+                asyncio.create_task(self._load_channels_for_guild(item.guild_id))
             
             elif isinstance(item, ChannelListItem):
                 self.selected_channel = item.channel_id
@@ -279,10 +279,10 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
                 message_viewer.set_channel(item.channel_id)
                 self.notify(f"Selected channel: #{item.channel_name}")
 
-        def _load_channels_for_guild(self, guild_id: int) -> None:
+        async def _load_channels_for_guild(self, guild_id: int) -> None:
             """Load channels for a specific guild."""
             try:
-                channels = discord_logger.get_guild_channels(guild_id)
+                channels = await discord_logger.get_guild_channels(guild_id)
                 channel_list = self.query_one("#channel-list", ListView)
                 channel_list.clear()
                 
@@ -368,7 +368,7 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
                 if guilds:
                     first_guild_id, _ = guilds[0]
                     self.selected_guild = first_guild_id
-                    self._load_channels_for_guild(first_guild_id)
+                    asyncio.create_task(self._load_channels_for_guild(first_guild_id))
             
             except Exception as e:
                 logger.error(f"Error refreshing guilds: {e}")

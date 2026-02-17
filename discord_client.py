@@ -2,7 +2,8 @@
 
 import discord
 import asyncio
-from typing import Optional, Callable, Any
+import json
+from typing import Optional, Callable, Any, cast
 from db import DiscordDB
 import logging
 
@@ -50,6 +51,42 @@ class DiscordMessageLogger:
                 return
             self.db.add_reaction(reaction.message.id, str(reaction.emoji))
 
+    def _channel_type_name(self, channel: Any) -> str:
+        """Get a stable channel type name for storage."""
+        channel_type = getattr(channel, "type", None)
+        if channel_type is None:
+            return channel.__class__.__name__
+        try:
+            return str(channel_type)
+        except Exception:
+            return channel.__class__.__name__
+
+    def _channel_display_name(self, channel: Any) -> str:
+        """Build a readable channel display name."""
+        name = getattr(channel, "name", None) or str(channel)
+        parent = getattr(channel, "parent", None)
+        parent_name = getattr(parent, "name", None) if parent else None
+        if parent_name:
+            return f"{parent_name} / {name}"
+        return name
+
+    def _channel_payload(self, channel: Any) -> Optional[dict[str, Any]]:
+        """Build a JSON-safe payload for a channel."""
+        if hasattr(channel, "to_dict"):
+            try:
+                payload = channel.to_dict()
+                json.dumps(payload, ensure_ascii=False)
+                return payload
+            except Exception:
+                pass
+        return {
+            "id": getattr(channel, "id", None),
+            "guild_id": channel.guild.id if getattr(channel, "guild", None) else None,
+            "name": getattr(channel, "name", None),
+            "type": self._channel_type_name(channel),
+            "parent_id": getattr(channel, "parent_id", None),
+        }
+
     async def _save_message(self, message: discord.Message, edited: bool = False):
         """Save a single message to database."""
         try:
@@ -60,7 +97,7 @@ class DiscordMessageLogger:
             raw_payload: Optional[dict[str, Any]] = None
             if hasattr(message, "to_dict"):
                 try:
-                    raw_payload = message.to_dict()
+                    raw_payload = cast(Any, message).to_dict()
                 except Exception:
                     raw_payload = None
 
@@ -145,8 +182,37 @@ class DiscordMessageLogger:
             guilds.append((guild.id, guild.name))
         return guilds
 
-    def get_guild_channels(self, guild_id: int) -> list[tuple[int, str]]:
-        """Get list of text channels in a guild."""
+    async def _fetch_archived_threads(self, channel: Any) -> list[Any]:
+        """Fetch archived threads for a channel if supported."""
+        if not hasattr(channel, "archived_threads"):
+            return []
+
+        archived: list[Any] = []
+        try:
+            async for thread in channel.archived_threads(limit=None):
+                archived.append(thread)
+            return archived
+        except TypeError:
+            pass
+        except Exception as exc:
+            logger.debug(f"Failed to fetch archived threads for {channel}: {exc}")
+            return archived
+
+        for kwargs in (
+            {"limit": None, "public": True},
+            {"limit": None, "private": True},
+            {"limit": None, "joined": True},
+        ):
+            try:
+                async for thread in channel.archived_threads(**kwargs):
+                    archived.append(thread)
+            except Exception:
+                continue
+
+        return archived
+
+    async def get_guild_channels(self, guild_id: int) -> list[tuple[int, str]]:
+        """Get list of messageable channels and threads in a guild."""
         guild = self.client.get_guild(guild_id)
         if guild is None:
             logger.error(f"Guild {guild_id} not found")
@@ -158,13 +224,49 @@ class DiscordMessageLogger:
             logger.error(f"Bot member not found in guild {guild_id}")
             return []
 
-        channels = []
-        for channel in guild.text_channels:
-            # Check if bot has permission to read this channel
-            if channel.permissions_for(me).read_messages:
-                channels.append((channel.id, channel.name))
-                # Also save to database
-                self.db.add_channel(channel.id, guild.id, channel.name)
+        def can_read(channel: Any) -> bool:
+            if not hasattr(channel, "permissions_for"):
+                return True
+            perms = channel.permissions_for(me)
+            return bool(getattr(perms, "read_messages", False) or getattr(perms, "read_message_history", False))
+
+        candidates: list[Any] = []
+        text_channels = list(getattr(guild, "text_channels", []))
+        forum_channels = list(getattr(guild, "forum_channels", []))
+        if not forum_channels:
+            forum_channels = list(getattr(guild, "forums", []))
+
+        candidates.extend(text_channels)
+        candidates.extend(getattr(guild, "voice_channels", []))
+        candidates.extend(getattr(guild, "stage_channels", []))
+        candidates.extend(forum_channels)
+        candidates.extend(getattr(guild, "threads", []))
+
+        for parent_channel in text_channels + forum_channels:
+            candidates.extend(getattr(parent_channel, "threads", []))
+            candidates.extend(await self._fetch_archived_threads(parent_channel))
+
+        channels: list[tuple[int, str]] = []
+        seen_ids: set[int] = set()
+        for channel in candidates:
+            channel_id = getattr(channel, "id", None)
+            if channel_id is None or channel_id in seen_ids:
+                continue
+            if not can_read(channel):
+                continue
+            seen_ids.add(channel_id)
+
+            display_name = self._channel_display_name(channel)
+            channels.append((channel_id, display_name))
+            self.db.add_channel(
+                channel_id=channel_id,
+                guild_id=guild.id,
+                channel_name=display_name,
+                parent_channel_id=getattr(channel, "parent_id", None),
+                channel_type=self._channel_type_name(channel),
+                raw_json=self._channel_payload(channel),
+            )
+
         return channels
 
     def get_current_user_display(self) -> Optional[str]:
@@ -187,15 +289,18 @@ class DiscordMessageLogger:
                 logger.error(f"Channel {channel_id} not found")
                 return
 
-            if not isinstance(channel, discord.TextChannel):
-                logger.error(f"Channel {channel_id} is not a text channel")
+            if not hasattr(channel, "history"):
+                logger.error(f"Channel {channel_id} does not support history")
                 return
 
             # Add channel to database
             self.db.add_channel(
                 channel_id=channel.id,
-                guild_id=channel.guild.id,
-                channel_name=channel.name,
+                guild_id=channel.guild.id if channel.guild else 0,
+                channel_name=self._channel_display_name(channel),
+                parent_channel_id=getattr(channel, "parent_id", None),
+                channel_type=self._channel_type_name(channel),
+                raw_json=self._channel_payload(channel),
             )
 
             # Set sync status to syncing
@@ -208,10 +313,11 @@ class DiscordMessageLogger:
             batch_count = 0
             last_message_id = None
 
-            logger.info(f"Starting to sync channel {channel.name} (ID: {channel_id})")
+            channel_label = self._channel_display_name(channel)
+            logger.info(f"Starting to sync channel {channel_label} (ID: {channel_id})")
 
             # Iterate through message history
-            async for message in channel.history(limit=None, oldest_first=False):
+            async for message in cast(Any, channel).history(limit=None, oldest_first=False):
                 # Stop if we reach a message we've already saved
                 if last_saved_id and message.id <= last_saved_id:
                     logger.info(f"Reached previously synced message {message.id}")
@@ -226,7 +332,7 @@ class DiscordMessageLogger:
                 if batch_count % self.BATCH_SIZE == 0:
                     if progress_callback:
                         total_count = self.db.get_message_count(channel.id)
-                        progress_callback(f"Syncing {channel.name}", total_count, message_count)
+                        progress_callback(f"Syncing {channel_label}", total_count, message_count)
                     await asyncio.sleep(self.REQUEST_DELAY * 5)  # Longer delay after batch
 
                 await asyncio.sleep(self.REQUEST_DELAY)
@@ -234,11 +340,11 @@ class DiscordMessageLogger:
             # Update sync state
             self.db.set_sync_state(channel.id, last_message_id, "completed")
 
-            logger.info(f"Finished syncing channel {channel.name}: {message_count} messages processed")
+            logger.info(f"Finished syncing channel {channel_label}: {message_count} messages processed")
             
             if progress_callback:
                 total_count = self.db.get_message_count(channel.id)
-                progress_callback(f"Completed {channel.name}", total_count, total_count)
+                progress_callback(f"Completed {channel_label}", total_count, total_count)
 
         except Exception as e:
             logger.error(f"Error syncing channel {channel_id}: {e}")
