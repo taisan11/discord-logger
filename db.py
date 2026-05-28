@@ -21,6 +21,10 @@ class DiscordDB:
         if self.connection is None:
             self.connection = sqlite3.connect(str(self.db_path))
             self.connection.row_factory = sqlite3.Row
+            self.connection.execute("PRAGMA foreign_keys = ON")
+            self.connection.execute("PRAGMA journal_mode = WAL")
+            self.connection.execute("PRAGMA synchronous = NORMAL")
+            self.connection.execute("PRAGMA temp_store = MEMORY")
 
     def close(self):
         """Close database connection."""
@@ -38,7 +42,7 @@ class DiscordDB:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 channel_id INTEGER PRIMARY KEY,
-                guild_id INTEGER NOT NULL,
+                guild_id INTEGER,
                 channel_name TEXT NOT NULL,
                 parent_channel_id INTEGER,
                 channel_type TEXT,
@@ -116,6 +120,19 @@ class DiscordDB:
             )
         """)
 
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_channel_created_at
+            ON messages (channel_id, created_at DESC)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_channel_message_id
+            ON messages (channel_id, message_id DESC)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_channels_guild_id
+            ON channels (guild_id)
+        """)
+
         self.connection.commit()
 
         # Ensure schema upgrades for existing databases
@@ -154,7 +171,7 @@ class DiscordDB:
     def add_channel(
         self,
         channel_id: int,
-        guild_id: int,
+        guild_id: Optional[int],
         channel_name: str,
         parent_channel_id: Optional[int] = None,
         channel_type: Optional[str] = None,
@@ -225,6 +242,26 @@ class DiscordDB:
         cursor = self.connection.cursor()
         cursor.execute("SELECT COUNT(*) as count FROM messages WHERE channel_id = ?", (channel_id,))
         return cursor.fetchone()["count"]
+
+    def get_message_counts(self, channel_ids: List[int]) -> Dict[int, int]:
+        """Get message counts for multiple channels in one query."""
+        if not channel_ids:
+            return {}
+
+        self.connect()
+        assert self.connection is not None
+        cursor = self.connection.cursor()
+        placeholders = ",".join("?" for _ in channel_ids)
+        cursor.execute(
+            f"""
+                SELECT channel_id, COUNT(*) as count
+                FROM messages
+                WHERE channel_id IN ({placeholders})
+                GROUP BY channel_id
+            """,
+            channel_ids,
+        )
+        return {int(row["channel_id"]): int(row["count"]) for row in cursor.fetchall()}
 
     def export_raw_messages_json(
         self,
@@ -333,3 +370,12 @@ class DiscordDB:
         """, (channel_id,))
         row = cursor.fetchone()
         return row["message_id"] if row else None
+
+    def get_channel(self, channel_id: int) -> Optional[Dict[str, Any]]:
+        """Get channel metadata by ID."""
+        self.connect()
+        assert self.connection is not None
+        cursor = self.connection.cursor()
+        cursor.execute("SELECT * FROM channels WHERE channel_id = ?", (channel_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None

@@ -42,6 +42,21 @@ class ChannelListItem(ListItem):
         return f"#{self.channel_name} ({self.message_count} messages)"
 
 
+class DMListItem(ListItem):
+    """Custom list item for direct messages."""
+
+    def __init__(self, channel_id: int, recipient_name: str, recipient_id: int, message_count: int):
+        super().__init__()
+        self.channel_id = channel_id
+        self.recipient_name = recipient_name
+        self.recipient_id = recipient_id
+        self.message_count = message_count
+        self.is_dm = True
+
+    def render(self) -> str:
+        return f"💬 {self.recipient_name} ({self.message_count} messages)"
+
+
 class SyncStatusPanel(Static):
     """Panel showing sync status and progress."""
 
@@ -158,12 +173,22 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
             border: solid $accent;
         }
 
+        #dm-panel {
+            height: 6;
+            border: solid $accent;
+        }
+
         #channel-panel {
             height: 1fr;
             border: solid $accent;
         }
 
         #guild-list {
+            width: 1fr;
+            height: 1fr;
+        }
+
+        #dm-list {
             width: 1fr;
             height: 1fr;
         }
@@ -214,11 +239,15 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
                 yield Label("[bold]Discord Message Logger[/bold]", id="title")
 
                 with Horizontal(id="content"):
-                    # Left panel: Guild and Channel selection
+                    # Left panel: Guild, DM, and Channel selection
                     with Vertical(id="left-panel"):
                         with Vertical(id="guild-panel"):
                             yield Label("[bold cyan]Servers[/bold cyan]")
                             yield ListView(id="guild-list")
+                        
+                        with Vertical(id="dm-panel"):
+                            yield Label("[bold cyan]Direct Messages[/bold cyan]")
+                            yield ListView(id="dm-list")
                         
                         with Vertical(id="channel-panel"):
                             yield Label("[bold cyan]Channels[/bold cyan]")
@@ -273,6 +302,12 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
                 self.notify(f"Selected server: {item.guild_name}")
                 asyncio.create_task(self._load_channels_for_guild(item.guild_id))
             
+            elif isinstance(item, DMListItem):
+                self.selected_channel = item.channel_id
+                message_viewer = self.query_one("#message-viewer", MessageViewerWidget)
+                message_viewer.set_channel(item.channel_id)
+                self.notify(f"Selected DM: {item.recipient_name}")
+            
             elif isinstance(item, ChannelListItem):
                 self.selected_channel = item.channel_id
                 message_viewer = self.query_one("#message-viewer", MessageViewerWidget)
@@ -285,14 +320,14 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
                 channels = await discord_logger.get_guild_channels(guild_id)
                 channel_list = self.query_one("#channel-list", ListView)
                 channel_list.clear()
+                message_counts = db.get_message_counts([channel_id for channel_id, _ in channels])
                 
                 for channel_id, channel_name in channels:
-                    message_count = db.get_message_count(channel_id)
                     item = ChannelListItem(
                         channel_id=channel_id,
                         channel_name=channel_name,
                         guild_id=guild_id,
-                        message_count=message_count,
+                        message_count=message_counts.get(channel_id, 0),
                     )
                     channel_list.append(item)
                 
@@ -305,14 +340,13 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
         def action_sync(self) -> None:
             """Sync history action."""
             if not self.selected_channel:
-                self.notify("Please select a channel first", severity="warning")
+                self.notify("Please select a channel or DM first", severity="warning")
                 return
 
             if discord_logger.is_syncing:
                 self.notify("Already syncing", severity="warning")
                 return
 
-            # capture and narrow the type of selected_channel to int
             channel_id = self.selected_channel
             assert channel_id is not None
 
@@ -326,10 +360,20 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
                 status_panel.status_text = f"{status}: {current}/{total}"
 
             async def do_sync():
-                await discord_logger.sync_channel_history(
-                    channel_id,
-                    progress_callback=progress_callback
-                )
+                # Check if this is a DM channel by querying the database
+                channel_info = db.get_channel(channel_id)
+                is_dm = channel_info and channel_info.get("guild_id") is None and channel_info.get("channel_type") == "dm"
+                
+                if is_dm:
+                    await discord_logger.sync_dm_history(
+                        channel_id,
+                        progress_callback=progress_callback
+                    )
+                else:
+                    await discord_logger.sync_channel_history(
+                        channel_id,
+                        progress_callback=progress_callback
+                    )
                 message_viewer = self.query_one("#message-viewer", MessageViewerWidget)
                 message_viewer.refresh()
 
@@ -347,13 +391,13 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
 
         @on(Button.Pressed, "#btn-refresh")
         def action_refresh(self) -> None:
-            """Refresh action - reload guilds and channels."""
+            """Refresh action - reload guilds, DMs, and channels."""
             try:
+                # Load guilds
                 guilds = discord_logger.get_guilds()
                 
                 if not guilds:
                     self.notify("No servers found. Make sure Discord client is connected.", severity="warning")
-                    return
                 
                 guild_list = self.query_one("#guild-list", ListView)
                 guild_list.clear()
@@ -362,7 +406,26 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
                     item = GuildListItem(guild_id=guild_id, guild_name=guild_name)
                     guild_list.append(item)
                 
-                self.notify(f"Loaded {len(guilds)} servers")
+                guild_count = len(guilds)
+                
+                # Load DMs
+                dms = discord_logger.get_direct_messages()
+                dm_list = self.query_one("#dm-list", ListView)
+                dm_list.clear()
+                dm_message_counts = db.get_message_counts([channel_id for channel_id, _, _ in dms])
+                
+                for channel_id, recipient_name, recipient_id in dms:
+                    item = DMListItem(
+                        channel_id=channel_id,
+                        recipient_name=recipient_name,
+                        recipient_id=recipient_id,
+                        message_count=dm_message_counts.get(channel_id, 0),
+                    )
+                    dm_list.append(item)
+                
+                dm_count = len(dms)
+                
+                self.notify(f"Loaded {guild_count} servers and {dm_count} DMs")
                 
                 # Auto-select first guild
                 if guilds:
@@ -371,7 +434,7 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
                     asyncio.create_task(self._load_channels_for_guild(first_guild_id))
             
             except Exception as e:
-                logger.error(f"Error refreshing guilds: {e}")
+                logger.error(f"Error refreshing: {e}")
                 self.notify(f"Error refreshing: {e}", severity="error")
 
         @on(Button.Pressed, "#btn-exit")

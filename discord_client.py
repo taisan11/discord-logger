@@ -3,11 +3,21 @@
 import discord
 import asyncio
 import json
+from dataclasses import dataclass
 from typing import Optional, Callable, Any, cast
 from db import DiscordDB
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryTarget:
+    """A single channel or DM to sync in CLI mode."""
+
+    channel_id: int
+    label: str
+    is_dm: bool
 
 
 class DiscordMessageLogger:
@@ -88,7 +98,10 @@ class DiscordMessageLogger:
         }
 
     async def _save_message(self, message: discord.Message, edited: bool = False):
-        """Save a single message to database."""
+        """Save a single message to database.
+        
+        Handles both guild messages and DMs. For DMs, guild_id will be None.
+        """
         try:
             # Skip bot messages and system messages for now
             if message.author.bot and message.author != self.client.user:
@@ -277,6 +290,64 @@ class DiscordMessageLogger:
         display_name = getattr(user, "display_name", None) or user.name
         return display_name
 
+    def get_direct_messages(self) -> list[tuple[int, str, int]]:
+        """Get list of available DMs from friends.
+        
+        Returns list of (channel_id, recipient_name, recipient_id) tuples.
+        Uses discord.Client.friends to retrieve available DM channels.
+        """
+        dms: list[tuple[int, str, int]] = []
+        
+        # Get current user's private channels (DMs)
+        for channel in self.client.private_channels:
+            # Skip group DMs for now, focus on 1-to-1 DMs
+            if isinstance(channel, discord.DMChannel):
+                recipient = channel.recipient
+                if recipient is None:
+                    continue
+                dms.append((channel.id, recipient.name, recipient.id))
+                # Add channel to database with guild_id = None for DMs
+                self.db.add_channel(
+                    channel_id=channel.id,
+                    guild_id=None,  # DMs have no guild
+                    channel_name=f"DM with {recipient.name}",
+                    parent_channel_id=None,
+                    channel_type="dm",
+                    raw_json=self._channel_payload(channel),
+                )
+        
+        return dms
+
+    async def get_history_targets(self) -> list[HistoryTarget]:
+        """Get all syncable history targets for CLI mode."""
+        targets: list[HistoryTarget] = []
+        seen_ids: set[int] = set()
+
+        for guild_id, _ in self.get_guilds():
+            for channel_id, channel_name in await self.get_guild_channels(guild_id):
+                if channel_id in seen_ids:
+                    continue
+
+                channel = self.client.get_channel(channel_id)
+                if channel is None or not hasattr(channel, "history"):
+                    continue
+
+                seen_ids.add(channel_id)
+                targets.append(HistoryTarget(channel_id=channel_id, label=channel_name, is_dm=False))
+
+        for channel_id, recipient_name, _ in self.get_direct_messages():
+            if channel_id in seen_ids:
+                continue
+
+            channel = self.client.get_channel(channel_id)
+            if channel is None or not hasattr(channel, "history"):
+                continue
+
+            seen_ids.add(channel_id)
+            targets.append(HistoryTarget(channel_id=channel_id, label=f"DM with {recipient_name}", is_dm=True))
+
+        return targets
+
 
     async def sync_channel_history(self, channel_id: int, progress_callback: Optional[Callable[[str, int, int], Any]] = None):
         """Sync message history for a specific channel with rate limiting."""
@@ -349,6 +420,86 @@ class DiscordMessageLogger:
         except Exception as e:
             logger.error(f"Error syncing channel {channel_id}: {e}")
             self.db.set_sync_state(channel_id, None, "error")
+        finally:
+            self.is_syncing = False
+
+    async def sync_dm_history(self, dm_channel_id: int, progress_callback: Optional[Callable[[str, int, int], Any]] = None):
+        """Sync message history for a DM channel with rate limiting."""
+        try:
+            self.is_syncing = True
+            self.sync_progress_callback = progress_callback
+
+            channel = self.client.get_channel(dm_channel_id)
+            if channel is None:
+                logger.error(f"DM channel {dm_channel_id} not found")
+                return
+
+            if not isinstance(channel, discord.DMChannel):
+                logger.error(f"Channel {dm_channel_id} is not a DM channel")
+                return
+
+            if not hasattr(channel, "history"):
+                logger.error(f"DM channel {dm_channel_id} does not support history")
+                return
+
+            # Add channel to database with guild_id = None for DMs
+            recipient = channel.recipient
+            recipient_name = recipient.name if recipient else "Unknown"
+            self.db.add_channel(
+                channel_id=channel.id,
+                guild_id=None,  # DMs have no guild
+                channel_name=f"DM with {recipient_name}",
+                parent_channel_id=None,
+                channel_type="dm",
+                raw_json=self._channel_payload(channel),
+            )
+
+            # Set sync status to syncing
+            self.db.set_sync_state(channel.id, None, "syncing")
+
+            # Get the last saved message ID for this channel
+            last_saved_id = self.db.get_last_message_id(channel.id)
+
+            message_count = 0
+            batch_count = 0
+            last_message_id = None
+
+            channel_label = f"DM with {recipient_name}"
+            logger.info(f"Starting to sync {channel_label} (ID: {dm_channel_id})")
+
+            # Iterate through message history
+            async for message in cast(Any, channel).history(limit=None, oldest_first=False):
+                # Stop if we reach a message we've already saved
+                if last_saved_id and message.id <= last_saved_id:
+                    logger.info(f"Reached previously synced message {message.id}")
+                    break
+
+                await self._save_message(message)
+                message_count += 1
+                last_message_id = message.id
+
+                # Rate limiting
+                batch_count += 1
+                if batch_count % self.BATCH_SIZE == 0:
+                    if progress_callback:
+                        total_count = self.db.get_message_count(channel.id)
+                        progress_callback(f"Syncing {channel_label}", total_count, message_count)
+                    await asyncio.sleep(self.REQUEST_DELAY * 5)  # Longer delay after batch
+
+                await asyncio.sleep(self.REQUEST_DELAY)
+
+            # Update sync state
+            self.db.set_sync_state(channel.id, last_message_id, "completed")
+
+            logger.info(f"Finished syncing {channel_label}: {message_count} messages processed")
+            
+            if progress_callback:
+                total_count = self.db.get_message_count(channel.id)
+                progress_callback(f"Completed {channel_label}", total_count, total_count)
+
+        except Exception as e:
+            logger.error(f"Error syncing DM channel {dm_channel_id}: {e}")
+            self.db.set_sync_state(dm_channel_id, None, "error")
         finally:
             self.is_syncing = False
 

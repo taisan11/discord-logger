@@ -25,6 +25,15 @@ try:
     assert hasattr(discord_logger, 'get_guild_channels'), "get_guild_channels method not found"
     print("✓ get_guild_channels method exists")
     
+    assert hasattr(discord_logger, 'get_direct_messages'), "get_direct_messages method not found"
+    print("✓ get_direct_messages method exists")
+    
+    assert hasattr(discord_logger, 'sync_dm_history'), "sync_dm_history method not found"
+    print("✓ sync_dm_history method exists")
+
+    assert hasattr(discord_logger, 'get_history_targets'), "get_history_targets method not found"
+    print("✓ get_history_targets method exists")
+    
     # Test that methods are callable
     assert callable(discord_logger.get_guilds), "get_guilds is not callable"
     print("✓ get_guilds is callable")
@@ -32,11 +41,34 @@ try:
     assert callable(discord_logger.get_guild_channels), "get_guild_channels is not callable"
     print("✓ get_guild_channels is callable")
     
+    assert callable(discord_logger.get_direct_messages), "get_direct_messages is not callable"
+    print("✓ get_direct_messages is callable")
+    
+    assert callable(discord_logger.sync_dm_history), "sync_dm_history is not callable"
+    print("✓ sync_dm_history is callable")
+
+    assert callable(discord_logger.get_history_targets), "get_history_targets is not callable"
+    print("✓ get_history_targets is callable")
+    
     # Test database add_channel
     db.add_channel(123456, 654321, "test-channel")
     channels = db.get_channels()
     assert len(channels) > 0, "No channels found after insertion"
     print("✓ add_channel works")
+    
+    # Test database get_channel
+    channel_info = db.get_channel(123456)
+    assert channel_info is not None, "get_channel returned None"
+    assert channel_info["channel_id"] == 123456, "Channel ID mismatch"
+    print("✓ get_channel works")
+    
+    # Test DM channel (guild_id = None)
+    db.add_channel(789012, None, "DM with test-user", channel_type="dm")
+    dm_info = db.get_channel(789012)
+    assert dm_info is not None, "DM channel not found"
+    assert dm_info["guild_id"] is None, "DM channel should have guild_id = None"
+    assert dm_info["channel_type"] == "dm", "Channel type should be 'dm'"
+    print("✓ DM channel storage works")
     
     print("\n" + "="*50)
     print("All method tests passed! ✓")
