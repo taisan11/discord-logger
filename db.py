@@ -197,6 +197,21 @@ class DiscordDB:
         cursor.execute("SELECT * FROM channels ORDER BY created_at DESC")
         return [dict(row) for row in cursor.fetchall()]
 
+    def get_channels_by_guild(self, guild_id: int) -> List[Dict[str, Any]]:
+        """Get all tracked channels for a guild in insertion order."""
+        self.connect()
+        assert self.connection is not None
+        cursor = self.connection.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM channels
+            WHERE guild_id = ?
+            ORDER BY created_at ASC, channel_id ASC
+            """,
+            (guild_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
     def add_message(
         self,
         message_id: int,
@@ -262,6 +277,52 @@ class DiscordDB:
             channel_ids,
         )
         return {int(row["channel_id"]): int(row["count"]) for row in cursor.fetchall()}
+
+    def get_message_count_for_channels(self, channel_ids: List[int]) -> int:
+        """Get a total message count across multiple channels."""
+        if not channel_ids:
+            return 0
+
+        self.connect()
+        assert self.connection is not None
+        cursor = self.connection.cursor()
+        placeholders = ",".join("?" for _ in channel_ids)
+        cursor.execute(
+            f"""
+                SELECT COUNT(*) as count
+                FROM messages
+                WHERE channel_id IN ({placeholders})
+            """,
+            channel_ids,
+        )
+        row = cursor.fetchone()
+        return int(row["count"]) if row else 0
+
+    def get_messages_for_channels(self, channel_ids: List[int], limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """Get messages from multiple channels ordered by newest first."""
+        if not channel_ids:
+            return []
+
+        self.connect()
+        assert self.connection is not None
+        cursor = self.connection.cursor()
+        placeholders = ",".join("?" for _ in channel_ids)
+        cursor.execute(
+            f"""
+                SELECT
+                    m.*,
+                    c.channel_name AS channel_name,
+                    c.parent_channel_id AS parent_channel_id,
+                    c.channel_type AS channel_type
+                FROM messages m
+                LEFT JOIN channels c ON c.channel_id = m.channel_id
+                WHERE m.channel_id IN ({placeholders})
+                ORDER BY m.created_at DESC, m.message_id DESC
+                LIMIT ? OFFSET ?
+            """,
+            channel_ids + [limit, offset],
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
     def export_raw_messages_json(
         self,

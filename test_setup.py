@@ -58,7 +58,25 @@ try:
     assert len(messages) > 0, "No messages found after insertion"
     assert messages[0]["content"] == "Test message"
     print("✓ Message insertion/retrieval works")
-    
+
+    # Test parent/child channel queries and aggregated message reads
+    db.add_channel(123457, 654321, "test-thread", parent_channel_id=123456)
+    db.add_message(
+        message_id=111112,
+        channel_id=123457,
+        user_id=222223,
+        username="ThreadUser",
+        content="Thread message",
+        created_at=datetime.now(),
+    )
+    guild_channels = db.get_channels_by_guild(654321)
+    assert len(guild_channels) == 2, f"Expected 2 guild channels, got {len(guild_channels)}"
+    grouped_count = db.get_message_count_for_channels([123456, 123457])
+    assert grouped_count == 2, f"Expected 2 grouped messages, got {grouped_count}"
+    grouped_messages = db.get_messages_for_channels([123456, 123457], limit=10)
+    assert len(grouped_messages) == 2, f"Expected 2 grouped messages, got {len(grouped_messages)}"
+    print("✓ Grouped channel queries work")
+
     # Test message count
     count = db.get_message_count(123456)
     assert count == 1, f"Expected 1 message, got {count}"

@@ -24,7 +24,13 @@ try:
     
     assert hasattr(discord_logger, 'get_guild_channels'), "get_guild_channels method not found"
     print("✓ get_guild_channels method exists")
-    
+
+    assert hasattr(discord_logger, 'get_cached_guild_channels'), "get_cached_guild_channels method not found"
+    print("✓ get_cached_guild_channels method exists")
+
+    assert hasattr(discord_logger, 'save_channel_metadata'), "save_channel_metadata method not found"
+    print("✓ save_channel_metadata method exists")
+
     assert hasattr(discord_logger, 'get_direct_messages'), "get_direct_messages method not found"
     print("✓ get_direct_messages method exists")
     
@@ -40,7 +46,13 @@ try:
     
     assert callable(discord_logger.get_guild_channels), "get_guild_channels is not callable"
     print("✓ get_guild_channels is callable")
-    
+
+    assert callable(discord_logger.get_cached_guild_channels), "get_cached_guild_channels is not callable"
+    print("✓ get_cached_guild_channels is callable")
+
+    assert callable(discord_logger.save_channel_metadata), "save_channel_metadata is not callable"
+    print("✓ save_channel_metadata is callable")
+
     assert callable(discord_logger.get_direct_messages), "get_direct_messages is not callable"
     print("✓ get_direct_messages is callable")
     

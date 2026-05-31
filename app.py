@@ -8,7 +8,7 @@ from textual.reactive import reactive
 from textual.binding import Binding
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Optional
 from db import DiscordDB
 from discord_client import DiscordMessageLogger
 
@@ -31,12 +31,13 @@ class GuildListItem(ListItem):
 class ChannelListItem(ListItem):
     """Custom list item for channels."""
 
-    def __init__(self, channel_id: int, channel_name: str, guild_id: int, message_count: int):
+    def __init__(self, channel_id: int, channel_name: str, guild_id: int, message_count: int, channel_ids: list[int]):
         super().__init__()
         self.channel_id = channel_id
         self.channel_name = channel_name
         self.guild_id = guild_id
         self.message_count = message_count
+        self.channel_ids = channel_ids
 
     def render(self) -> str:
         return f"#{self.channel_name} ({self.message_count} messages)"
@@ -75,34 +76,48 @@ class SyncStatusPanel(Static):
 class MessageViewerWidget(Static):
     """Widget for displaying messages from selected channel."""
 
-    current_channel_id: Optional[int] = None
+    current_channel_ids: list[int] = []
+    current_channel_label: Optional[str] = None
     current_offset: int = 0
     db: Optional[DiscordDB] = None
     MESSAGES_PER_PAGE = 15
 
-    def set_channel(self, channel_id: int):
+    def set_channel(self, channel_ids: int | list[int], label: Optional[str] = None):
         """Set the current channel to view."""
-        self.current_channel_id = channel_id
+        if isinstance(channel_ids, int):
+            channel_ids = [channel_ids]
+        self.current_channel_ids = list(dict.fromkeys(channel_ids))
+        self.current_channel_label = label
         self.current_offset = 0
         self.refresh()
 
     def render(self) -> str:
-        if not self.current_channel_id:
+        if not self.current_channel_ids:
             return "[dim]No channel selected[/dim]"
 
         if not self.db:
             return "[dim]Database not initialized[/dim]"
 
-        messages = self.db.get_messages(self.current_channel_id, limit=self.MESSAGES_PER_PAGE, offset=self.current_offset)
+        messages = self.db.get_messages_for_channels(
+            self.current_channel_ids,
+            limit=self.MESSAGES_PER_PAGE,
+            offset=self.current_offset,
+        )
 
         if not messages:
             return "[dim]No messages to display[/dim]"
 
         output = ["[bold cyan]Messages[/bold cyan]", ""]
+        if self.current_channel_label:
+            output.append(f"[dim]{self.current_channel_label}[/dim]")
+            output.append("")
+
+        show_channel_names = len(self.current_channel_ids) > 1
         for msg in reversed(messages):
             timestamp = msg["created_at"][:19]
             username = msg["username"]
             content = msg["content"]
+            channel_name = msg.get("channel_name") or ""
             
             if msg["edited_at"]:
                 edit_mark = " [yellow](edited)[/yellow]"
@@ -115,6 +130,8 @@ class MessageViewerWidget(Static):
                 short_content += "..."
             
             output.append(f"[cyan]{username}[/cyan] {timestamp}{edit_mark}")
+            if show_channel_names and channel_name:
+                output.append(f"  [dim]{channel_name}[/dim]")
             output.append(f"  {short_content}")
             output.append("")
 
@@ -230,6 +247,34 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
 
         selected_guild: Optional[int] = None
         selected_channel: Optional[int] = None
+        selected_channel_ids: list[int] = []
+        selected_channel_label: Optional[str] = None
+
+        def _collect_descendant_channel_ids(self, root_channel_id: int, children_by_parent: dict[int, list[int]]) -> list[int]:
+            """Collect a channel and all of its descendants."""
+            collected: list[int] = []
+            stack = [root_channel_id]
+            seen: set[int] = set()
+
+            while stack:
+                channel_id = stack.pop()
+                if channel_id in seen:
+                    continue
+                seen.add(channel_id)
+                collected.append(channel_id)
+                for child_id in children_by_parent.get(channel_id, []):
+                    if child_id not in seen:
+                        stack.append(child_id)
+
+            return collected
+
+        def _set_selected_channel(self, channel_ids: list[int], label: Optional[str]) -> None:
+            """Update the active channel selection."""
+            self.selected_channel_ids = list(dict.fromkeys(channel_ids))
+            self.selected_channel = self.selected_channel_ids[0] if self.selected_channel_ids else None
+            self.selected_channel_label = label
+            message_viewer = self.query_one("#message-viewer", MessageViewerWidget)
+            message_viewer.set_channel(self.selected_channel_ids, label=label)
 
         def compose(self) -> ComposeResult:
             """Compose the UI layout."""
@@ -299,39 +344,71 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
             
             if isinstance(item, GuildListItem):
                 self.selected_guild = item.guild_id
+                self._set_selected_channel([], None)
                 self.notify(f"Selected server: {item.guild_name}")
-                asyncio.create_task(self._load_channels_for_guild(item.guild_id))
+                asyncio.create_task(self._load_channels_for_guild(item.guild_id, item.guild_name))
             
             elif isinstance(item, DMListItem):
-                self.selected_channel = item.channel_id
-                message_viewer = self.query_one("#message-viewer", MessageViewerWidget)
-                message_viewer.set_channel(item.channel_id)
+                self._set_selected_channel([item.channel_id], f"DM with {item.recipient_name}")
                 self.notify(f"Selected DM: {item.recipient_name}")
             
             elif isinstance(item, ChannelListItem):
-                self.selected_channel = item.channel_id
-                message_viewer = self.query_one("#message-viewer", MessageViewerWidget)
-                message_viewer.set_channel(item.channel_id)
+                self._set_selected_channel(item.channel_ids, f"#{item.channel_name}")
                 self.notify(f"Selected channel: #{item.channel_name}")
 
-        async def _load_channels_for_guild(self, guild_id: int) -> None:
+        async def _load_channels_for_guild(self, guild_id: int, guild_name: Optional[str] = None) -> None:
             """Load channels for a specific guild."""
             try:
-                channels = await discord_logger.get_guild_channels(guild_id)
                 channel_list = self.query_one("#channel-list", ListView)
                 channel_list.clear()
-                message_counts = db.get_message_counts([channel_id for channel_id, _ in channels])
-                
-                for channel_id, channel_name in channels:
+                stored_channels = db.get_channels_by_guild(guild_id)
+
+                if not stored_channels:
+                    await discord_logger.get_guild_channels(guild_id)
+                    stored_channels = db.get_channels_by_guild(guild_id)
+                else:
+                    cached_channels = discord_logger.get_cached_guild_channels(guild_id)
+                    stored_ids = {int(channel["channel_id"]) for channel in stored_channels}
+                    missing_channels = [channel for channel in cached_channels if int(channel.id) not in stored_ids]
+                    for channel in missing_channels:
+                        discord_logger.save_channel_metadata(channel)
+                    if missing_channels:
+                        stored_channels = db.get_channels_by_guild(guild_id)
+
+                stored_by_id = {int(channel["channel_id"]): channel for channel in stored_channels}
+                children_by_parent: dict[int, list[int]] = {}
+                visible_count = 0
+
+                for channel in stored_channels:
+                    parent_channel_id = channel.get("parent_channel_id")
+                    if parent_channel_id is None:
+                        continue
+                    children_by_parent.setdefault(int(parent_channel_id), []).append(int(channel["channel_id"]))
+
+                for channel_id, channel_row in stored_by_id.items():
+                    if channel_row.get("parent_channel_id") is not None:
+                        continue
+
+                    channel_ids = self._collect_descendant_channel_ids(channel_id, children_by_parent)
                     item = ChannelListItem(
                         channel_id=channel_id,
-                        channel_name=channel_name,
+                        channel_name=channel_row["channel_name"],
                         guild_id=guild_id,
-                        message_count=message_counts.get(channel_id, 0),
+                        message_count=db.get_message_count_for_channels(channel_ids),
+                        channel_ids=channel_ids,
                     )
                     channel_list.append(item)
-                
-                self.notify(f"Loaded {len(channels)} channels")
+                    visible_count += 1
+
+                if stored_by_id:
+                    all_channel_ids: list[int] = []
+                    for channel_id, channel_row in stored_by_id.items():
+                        if channel_row.get("parent_channel_id") is not None:
+                            continue
+                        all_channel_ids.extend(self._collect_descendant_channel_ids(channel_id, children_by_parent))
+                    self._set_selected_channel(all_channel_ids, f"Server {guild_name}" if guild_name else f"Server {guild_id}")
+
+                self.notify(f"Loaded {visible_count} channels")
             except Exception as e:
                 logger.error(f"Error loading channels: {e}")
                 self.notify(f"Error loading channels: {e}", severity="error")
@@ -339,16 +416,13 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
         @on(Button.Pressed, "#btn-sync")
         def action_sync(self) -> None:
             """Sync history action."""
-            if not self.selected_channel:
+            if not self.selected_channel_ids:
                 self.notify("Please select a channel or DM first", severity="warning")
                 return
 
             if discord_logger.is_syncing:
                 self.notify("Already syncing", severity="warning")
                 return
-
-            channel_id = self.selected_channel
-            assert channel_id is not None
 
             status_panel = self.query_one("#status-panel", SyncStatusPanel)
 
@@ -360,20 +434,24 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
                 status_panel.status_text = f"{status}: {current}/{total}"
 
             async def do_sync():
-                # Check if this is a DM channel by querying the database
-                channel_info = db.get_channel(channel_id)
-                is_dm = channel_info and channel_info.get("guild_id") is None and channel_info.get("channel_type") == "dm"
-                
-                if is_dm:
-                    await discord_logger.sync_dm_history(
-                        channel_id,
-                        progress_callback=progress_callback
-                    )
-                else:
-                    await discord_logger.sync_channel_history(
-                        channel_id,
-                        progress_callback=progress_callback
-                    )
+                for channel_id in self.selected_channel_ids:
+                    channel_info = db.get_channel(channel_id)
+                    if channel_info is None:
+                        logger.warning(f"Channel {channel_id} is missing from the database")
+                        continue
+
+                    channel = await discord_logger.resolve_channel(channel_id)
+                    if channel is None or not hasattr(channel, "history"):
+                        logger.info(f"Skipping non-syncable channel {channel_id}")
+                        continue
+
+                    is_dm = channel_info.get("guild_id") is None and channel_info.get("channel_type") == "dm"
+
+                    if is_dm:
+                        await discord_logger.sync_dm_history(channel_id, progress_callback=progress_callback)
+                    else:
+                        await discord_logger.sync_channel_history(channel_id, progress_callback=progress_callback)
+
                 message_viewer = self.query_one("#message-viewer", MessageViewerWidget)
                 message_viewer.refresh()
 
@@ -382,7 +460,7 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
         @on(Button.Pressed, "#btn-view")
         def action_view(self) -> None:
             """View action."""
-            if not self.selected_channel:
+            if not self.selected_channel_ids:
                 self.notify("Please select a channel first", severity="warning")
                 return
             message_viewer = self.query_one("#message-viewer", MessageViewerWidget)
@@ -431,7 +509,7 @@ def create_app_class(token: str, db: DiscordDB, discord_logger: DiscordMessageLo
                 if guilds:
                     first_guild_id, _ = guilds[0]
                     self.selected_guild = first_guild_id
-                    asyncio.create_task(self._load_channels_for_guild(first_guild_id))
+                    asyncio.create_task(self._load_channels_for_guild(first_guild_id, guilds[0][1]))
             
             except Exception as e:
                 logger.error(f"Error refreshing: {e}")

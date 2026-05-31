@@ -26,6 +26,8 @@ class DiscordMessageLogger:
     # Rate limiting: Discord's limit is 100 messages per ~2 seconds
     REQUEST_DELAY = 0.5  # seconds between requests (conservative to avoid rate limiting)
     BATCH_SIZE = 100  # messages per request
+    ARCHIVED_THREADS_MAX_RETRIES = 3
+    ARCHIVED_THREADS_RETRY_DELAY = 3.0
 
     def __init__(self, token: str, db: DiscordDB):
         self.token = token
@@ -201,28 +203,78 @@ class DiscordMessageLogger:
             return []
 
         archived: list[Any] = []
-        try:
-            async for thread in channel.archived_threads(limit=None):
-                archived.append(thread)
-            return archived
-        except TypeError:
-            pass
-        except Exception as exc:
-            logger.debug(f"Failed to fetch archived threads for {channel}: {exc}")
-            return archived
+        seen_ids: set[int] = set()
 
-        for kwargs in (
-            {"limit": None, "public": True},
-            {"limit": None, "private": True},
-            {"limit": None, "joined": True},
-        ):
+        for attempt in range(1, self.ARCHIVED_THREADS_MAX_RETRIES + 1):
             try:
-                async for thread in channel.archived_threads(**kwargs):
+                async for thread in channel.archived_threads(limit=None):
+                    thread_id = getattr(thread, "id", None)
+                    if thread_id is not None and thread_id in seen_ids:
+                        continue
+                    if thread_id is not None:
+                        seen_ids.add(thread_id)
                     archived.append(thread)
-            except Exception:
-                continue
+                break
+            except discord.HTTPException as exc:
+                if getattr(exc, "status", None) != 429 or attempt >= self.ARCHIVED_THREADS_MAX_RETRIES:
+                    logger.debug(f"Failed to fetch archived threads for {channel}: {exc}")
+                    break
+
+                retry_after = self._extract_retry_after(exc)
+                delay = max(retry_after, self.ARCHIVED_THREADS_RETRY_DELAY * attempt)
+                logger.warning(
+                    f"Rate limited while fetching archived threads for {channel}; "
+                    f"waiting {delay:.1f}s before retry {attempt + 1}/{self.ARCHIVED_THREADS_MAX_RETRIES}"
+                )
+                await asyncio.sleep(delay)
+            except Exception as exc:
+                logger.debug(f"Failed to fetch archived threads for {channel}: {exc}")
+                break
 
         return archived
+
+    def _guild_channel_candidates(self, guild: Any) -> list[Any]:
+        """Collect cached channel candidates from a guild."""
+        candidates: list[Any] = []
+        text_channels = list(getattr(guild, "text_channels", []))
+        forum_channels = list(getattr(guild, "forum_channels", []))
+        if not forum_channels:
+            forum_channels = list(getattr(guild, "forums", []))
+
+        candidates.extend(text_channels)
+        candidates.extend(getattr(guild, "voice_channels", []))
+        candidates.extend(getattr(guild, "stage_channels", []))
+        candidates.extend(forum_channels)
+        candidates.extend(getattr(guild, "threads", []))
+
+        for parent_channel in text_channels + forum_channels:
+            candidates.extend(getattr(parent_channel, "threads", []))
+
+        return candidates
+
+    def _extract_retry_after(self, exc: discord.HTTPException) -> float:
+        """Extract a retry delay from a Discord HTTP exception."""
+        retry_after = getattr(exc, "retry_after", None)
+        if isinstance(retry_after, (int, float)) and retry_after > 0:
+            return float(retry_after)
+
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers:
+            header_value = headers.get("Retry-After") or headers.get("retry-after")
+            if header_value is not None:
+                try:
+                    return float(header_value)
+                except (TypeError, ValueError):
+                    pass
+
+        payload = getattr(exc, "json", None)
+        if isinstance(payload, dict):
+            raw_retry_after = payload.get("retry_after")
+            if isinstance(raw_retry_after, (int, float)) and raw_retry_after > 0:
+                return float(raw_retry_after)
+
+        return self.ARCHIVED_THREADS_RETRY_DELAY
 
     async def get_guild_channels(self, guild_id: int) -> list[tuple[int, str]]:
         """Get list of messageable channels and threads in a guild."""
@@ -243,20 +295,13 @@ class DiscordMessageLogger:
             perms = channel.permissions_for(me)
             return bool(getattr(perms, "read_messages", False) or getattr(perms, "read_message_history", False))
 
-        candidates: list[Any] = []
+        candidates = self._guild_channel_candidates(guild)
         text_channels = list(getattr(guild, "text_channels", []))
         forum_channels = list(getattr(guild, "forum_channels", []))
         if not forum_channels:
             forum_channels = list(getattr(guild, "forums", []))
 
-        candidates.extend(text_channels)
-        candidates.extend(getattr(guild, "voice_channels", []))
-        candidates.extend(getattr(guild, "stage_channels", []))
-        candidates.extend(forum_channels)
-        candidates.extend(getattr(guild, "threads", []))
-
         for parent_channel in text_channels + forum_channels:
-            candidates.extend(getattr(parent_channel, "threads", []))
             candidates.extend(await self._fetch_archived_threads(parent_channel))
 
         channels: list[tuple[int, str]] = []
@@ -282,6 +327,48 @@ class DiscordMessageLogger:
 
         return channels
 
+    def get_cached_guild_channels(self, guild_id: int) -> list[Any]:
+        """Get guild channels that are already present in the local cache."""
+        guild = self.client.get_guild(guild_id)
+        if guild is None:
+            logger.error(f"Guild {guild_id} not found")
+            return []
+
+        me = guild.me
+        if me is None:
+            logger.error(f"Bot member not found in guild {guild_id}")
+            return []
+
+        def can_read(channel: Any) -> bool:
+            if not hasattr(channel, "permissions_for"):
+                return True
+            perms = channel.permissions_for(me)
+            return bool(getattr(perms, "read_messages", False) or getattr(perms, "read_message_history", False))
+
+        channels: list[Any] = []
+        seen_ids: set[int] = set()
+        for channel in self._guild_channel_candidates(guild):
+            channel_id = getattr(channel, "id", None)
+            if channel_id is None or channel_id in seen_ids:
+                continue
+            if not can_read(channel):
+                continue
+            seen_ids.add(channel_id)
+            channels.append(channel)
+
+        return channels
+
+    def save_channel_metadata(self, channel: Any) -> None:
+        """Persist a channel's metadata to the database."""
+        self.db.add_channel(
+            channel_id=channel.id,
+            guild_id=channel.guild.id if channel.guild else None,
+            channel_name=self._channel_display_name(channel),
+            parent_channel_id=getattr(channel, "parent_id", None),
+            channel_type=self._channel_type_name(channel),
+            raw_json=self._channel_payload(channel),
+        )
+
     def get_current_user_display(self) -> Optional[str]:
         """Get current user's display name if connected."""
         user = self.client.user
@@ -289,6 +376,30 @@ class DiscordMessageLogger:
             return None
         display_name = getattr(user, "display_name", None) or user.name
         return display_name
+
+    async def resolve_channel(self, channel_id: int) -> Optional[Any]:
+        """Resolve a channel from cache or fetch it from Discord."""
+        channel = self.client.get_channel(channel_id)
+        if channel is not None:
+            return channel
+
+        for attempt in range(1, self.ARCHIVED_THREADS_MAX_RETRIES + 1):
+            try:
+                return await self.client.fetch_channel(channel_id)
+            except discord.HTTPException as exc:
+                if getattr(exc, "status", None) != 429 or attempt >= self.ARCHIVED_THREADS_MAX_RETRIES:
+                    logger.debug(f"Failed to resolve channel {channel_id}: {exc}")
+                    return None
+
+                retry_after = self._extract_retry_after(exc)
+                delay = max(retry_after, self.ARCHIVED_THREADS_RETRY_DELAY)
+                logger.warning(
+                    f"Rate limited while resolving channel {channel_id}; "
+                    f"waiting {delay:.1f}s before retry {attempt + 1}/{self.ARCHIVED_THREADS_MAX_RETRIES}"
+                )
+                await asyncio.sleep(delay)
+
+        return None
 
     def get_direct_messages(self) -> list[tuple[int, str, int]]:
         """Get list of available DMs from friends.
@@ -328,7 +439,7 @@ class DiscordMessageLogger:
                 if channel_id in seen_ids:
                     continue
 
-                channel = self.client.get_channel(channel_id)
+                channel = await self.resolve_channel(channel_id)
                 if channel is None or not hasattr(channel, "history"):
                     continue
 
@@ -339,7 +450,7 @@ class DiscordMessageLogger:
             if channel_id in seen_ids:
                 continue
 
-            channel = self.client.get_channel(channel_id)
+            channel = await self.resolve_channel(channel_id)
             if channel is None or not hasattr(channel, "history"):
                 continue
 
@@ -355,7 +466,7 @@ class DiscordMessageLogger:
             self.is_syncing = True
             self.sync_progress_callback = progress_callback
 
-            channel = self.client.get_channel(channel_id)
+            channel = await self.resolve_channel(channel_id)
             if channel is None:
                 logger.error(f"Channel {channel_id} not found")
                 return
@@ -429,7 +540,7 @@ class DiscordMessageLogger:
             self.is_syncing = True
             self.sync_progress_callback = progress_callback
 
-            channel = self.client.get_channel(dm_channel_id)
+            channel = await self.resolve_channel(dm_channel_id)
             if channel is None:
                 logger.error(f"DM channel {dm_channel_id} not found")
                 return
